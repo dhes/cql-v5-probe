@@ -68,6 +68,8 @@ navigation layer over kotlin-fhir is an open ecosystem question.
 
 ## Context
 
-Author: a WHO SMART Guidelines DAK author (smart-cxca, cervical-cancer screening) running
-CQL/ELM on-device today via `PlanDefinition/$apply` on the android-fhir workflow stack. This
-probe scopes what it would take for that content to run on the post-HAPI KMP stack.
+Author: I maintain an independent SMART-Guidelines-style DAK for cervical-cancer screening
+(an L2→L4 encoding of WHO's 2021 screening recommendations — not a WHO publication; WHO has
+published the narrative guideline but no official DAK for it yet), and run its CQL/ELM
+on-device today via `PlanDefinition/$apply` on the android-fhir workflow stack. This probe
+scopes what it would take for that content to run on the post-HAPI KMP stack.
