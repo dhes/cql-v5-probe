@@ -1,6 +1,10 @@
 .gradle/
 .kotlin/
 build/
+bin/
 .DS_Store
 *.iml
 .idea/
+
+# local reference copies of upstream sources (HAPI etc.) — not ours to publish
+study/

@@ -12,6 +12,7 @@ dependencies {
     implementation("dev.ohs.fhir:fhir-model-r4:1.0.0-beta05")   // ← NEW: kotlin-fhir R4 model (KMP)
     implementation("org.slf4j:slf4j-api:2.0.16")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.16")
+		implementation(kotlin("reflect"))
 }
 
 application { mainClass.set("MainKt") }

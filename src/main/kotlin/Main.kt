@@ -19,6 +19,10 @@ import org.opencds.cqf.cql.engine.execution.Environment
 import org.opencds.cqf.cql.engine.runtime.ClassInstance
 import org.opencds.cqf.cql.engine.runtime.Value
 import org.opencds.cqf.cql.engine.runtime.toCqlString
+import kotlin.reflect.full.memberProperties
+import dev.ohs.fhir.model.r4.Date as FhirDateWrapper
+import dev.ohs.fhir.model.r4.FhirDate
+import org.opencds.cqf.cql.engine.runtime.Date as EngineDate
 
 private const val FHIR = "http://hl7.org/fhir"
 
@@ -27,22 +31,42 @@ private val FHIR_CQL = """
     using FHIR version '4.0.1'
     parameter "P" FHIR.Patient
     define "GenderValue": P.gender.value
+    define "BirthDateValue": P.birthDate.value
 """.trimIndent()
 
 /**
- * Increment 4 — the first REAL adapter slice: a live kotlin-fhir Patient -> engine ClassInstance.
- * Navigates the model's PUBLIC data-class property; kotlin-fhirpath's FhirModelNavigator is
- * `internal`, so it can't be reused here. Only `gender` is mapped — increment 5 generalizes this
- * into a real toCqlValue that walks all children (and confronts the reflection-free question).
+ * Increment 5a — the general walker's skeleton. Reflection enumerates the resource's
+ * properties at runtime; the `when` maps each value by its runtime type. One mapping
+ * row exists so far (Enumeration -> FHIR.code); anything unmapped prints a TODO —
+ * the literal work-list for increments 5c..5f.
  */
-private fun patientToClassInstance(p: Patient): ClassInstance {
+private fun toClassInstance(resource: Any, fhirTypeName: String): ClassInstance {
     val elements = mutableMapOf<String, Value?>()
-    p.gender?.value?.getCode()?.let { code ->
-        // FHIR code -> ClassInstance{ value: System.String } — the FHIR-primitive shape the engine unwraps
-        elements["gender"] =
-            ClassInstance(QName(FHIR, "code"), mutableMapOf<String, Value?>("value" to code.toCqlString()))
+    for (prop in resource::class.memberProperties) {
+        val raw = prop.getter.call(resource) ?: continue        // unset field -> absent
+        if (raw is Collection<*> && raw.isEmpty()) continue     // kotlin-fhir lists default to empty -> absent
+        when (raw) {
+            is Enumeration<*> -> {
+                val code = raw.value?.let { it::class.java.getMethod("getCode").invoke(it) as String }
+                if (code != null) {
+                    elements[prop.name] =
+                        ClassInstance(QName(FHIR, "code"), mutableMapOf<String, Value?>("value" to code.toCqlString()))
+                }
+            }
+            is FhirDateWrapper -> {                        // FHIR primitive `date`
+                raw.value?.let { fhirDate ->                // sealed: Year | YearMonth | Date
+                    // ISO toString + the engine's precision-inferring string ctor:
+                    // "1985" -> YEAR, "1985-03" -> MONTH, "1985-03-14" -> DAY
+                    elements[prop.name] = ClassInstance(
+                        QName(FHIR, "date"),
+                        mutableMapOf<String, Value?>("value" to EngineDate(fhirDate.toString())),
+                    )
+                }
+            }
+            else -> println("  TODO: no mapping row yet for ${prop.name} (${raw::class.simpleName})")
+        }
     }
-    return ClassInstance(QName(FHIR, "Patient"), elements)
+    return ClassInstance(QName(FHIR, fhirTypeName), elements)
 }
 
 private class InlineCqlSource(private val id: String, private val cql: String) : LibrarySourceProvider {
@@ -74,15 +98,18 @@ fun main() {
 
     // A REAL kotlin-fhir R4 Patient — the 'female' now originates from a live FHIR model object,
     // not a string literal. THIS is what increment 4 adds over increment 3.
-    val fhirPatient = Patient(gender = Enumeration.of(AdministrativeGender.Female, null))
+    val fhirPatient = Patient(
+			gender = Enumeration.of(AdministrativeGender.Female, null),
+			birthDate = FhirDateWrapper(value = FhirDate.fromString("1985")),
+			)
     println("kotlin-fhir Patient.gender.value.getCode() = ${fhirPatient.gender?.value?.getCode()}")
-    val patientCI = patientToClassInstance(fhirPatient)
+    val patientCI = toClassInstance(fhirPatient, "Patient")
 
     val probe = VersionedIdentifier().withId("Probe").withVersion("1.0.0")
-    val result = engine.evaluate {
-        library(probe) { expressions("GenderValue") }
+    val results = engine.evaluate {
+        library(probe) { expressions("GenderValue", "BirthDateValue") }
         parameters = mapOf("P" to patientCI)
-    }.onlyResultOrThrow["GenderValue"]?.value
-
-    println("v5 engine evaluated P.gender.value = $result   (expect: 'female')  ← sourced from a kotlin-fhir object")
+    }.onlyResultOrThrow
+    println("v5 engine evaluated P.gender.value    = ${results["GenderValue"]?.value}   (expect: 'female')")
+    println("v5 engine evaluated P.birthDate.value = ${results["BirthDateValue"]?.value}   (expect: 1985-03-14)")
 }
