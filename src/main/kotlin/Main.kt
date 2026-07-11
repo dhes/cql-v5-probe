@@ -23,6 +23,9 @@ import kotlin.reflect.full.memberProperties
 import dev.ohs.fhir.model.r4.Date as FhirDateWrapper
 import dev.ohs.fhir.model.r4.FhirDate
 import org.opencds.cqf.cql.engine.runtime.Date as EngineDate
+import dev.ohs.fhir.model.r4.String as FhirString
+import org.opencds.cqf.cql.engine.runtime.List as CqlList
+import dev.ohs.fhir.model.r4.HumanName
 
 private const val FHIR = "http://hl7.org/fhir"
 
@@ -32,39 +35,56 @@ private val FHIR_CQL = """
     parameter "P" FHIR.Patient
     define "GenderValue": P.gender.value
     define "BirthDateValue": P.birthDate.value
+    define "FamilyNameValue": First(P.name.family.value)
 """.trimIndent()
 
 /**
- * Increment 5a — the general walker's skeleton. Reflection enumerates the resource's
- * properties at runtime; the `when` maps each value by its runtime type. One mapping
- * row exists so far (Enumeration -> FHIR.code); anything unmapped prints a TODO —
- * the literal work-list for increments 5c..5f.
+ * Convert ONE kotlin-fhir value to the engine Value it maps to. Null = no mapping row yet.
+ * Expression-style: every row ENDS with its result; nothing is assigned here — the caller
+ * decides where converted values go.
+ */
+private fun convertValue(raw: Any): Value? = when (raw) {
+    // FHIR primitive `code` (required-binding enum): unwrap to the wire-format code string.
+    // The generated enums share no common interface, so getCode() is looked up reflectively.
+    is Enumeration<*> -> {
+        val code = raw.value?.let { it::class.java.getMethod("getCode").invoke(it) as String }
+        code?.let { ClassInstance(QName(FHIR, "code"), mutableMapOf<String, Value?>("value" to it.toCqlString())) }
+    }
+
+    // FHIR primitive `date`: every sealed FhirDate variant (Year | YearMonth | Date) has an
+    // ISO toString, and the engine's string ctor infers precision from the segment count
+    // ("1985" -> YEAR, "1985-03" -> MONTH, "1985-03-14" -> DAY) — partial precision survives.
+    is FhirDateWrapper -> raw.value?.let { fhirDate ->
+        ClassInstance(QName(FHIR, "date"), mutableMapOf<String, Value?>("value" to EngineDate(fhirDate.toString())))
+    }
+
+    // FHIR primitive `string`.
+    is FhirString -> raw.value?.let {
+        ClassInstance(QName(FHIR, "string"), mutableMapOf<String, Value?>("value" to it.toCqlString()))
+    }
+
+    // Complex types delegate back to the property walker — MUTUAL recursion.
+    is HumanName -> toClassInstance(raw, "HumanName")
+
+    // Lists: convert each element through this same dispatch — SELF recursion.
+    is List<*> -> CqlList(raw.map { element -> element?.let { convertValue(it) } })
+
+    else -> null
+}
+
+/**
+ * Walk ONE resource's properties via reflection and build its ClassInstance.
+ * Conversion of each value is delegated to convertValue (which recurses back
+ * here for complex types like HumanName).
  */
 private fun toClassInstance(resource: Any, fhirTypeName: String): ClassInstance {
     val elements = mutableMapOf<String, Value?>()
     for (prop in resource::class.memberProperties) {
         val raw = prop.getter.call(resource) ?: continue        // unset field -> absent
         if (raw is Collection<*> && raw.isEmpty()) continue     // kotlin-fhir lists default to empty -> absent
-        when (raw) {
-            is Enumeration<*> -> {
-                val code = raw.value?.let { it::class.java.getMethod("getCode").invoke(it) as String }
-                if (code != null) {
-                    elements[prop.name] =
-                        ClassInstance(QName(FHIR, "code"), mutableMapOf<String, Value?>("value" to code.toCqlString()))
-                }
-            }
-            is FhirDateWrapper -> {                        // FHIR primitive `date`
-                raw.value?.let { fhirDate ->                // sealed: Year | YearMonth | Date
-                    // ISO toString + the engine's precision-inferring string ctor:
-                    // "1985" -> YEAR, "1985-03" -> MONTH, "1985-03-14" -> DAY
-                    elements[prop.name] = ClassInstance(
-                        QName(FHIR, "date"),
-                        mutableMapOf<String, Value?>("value" to EngineDate(fhirDate.toString())),
-                    )
-                }
-            }
-            else -> println("  TODO: no mapping row yet for ${prop.name} (${raw::class.simpleName})")
-        }
+        val converted = convertValue(raw)
+        if (converted != null) elements[prop.name] = converted
+        else println("  TODO: no mapping row yet for ${prop.name} (${raw::class.simpleName})")
     }
     return ClassInstance(QName(FHIR, fhirTypeName), elements)
 }
@@ -96,20 +116,22 @@ fun main() {
     }
     val engine = CqlEngine(Environment(libraryManager), mutableSetOf(CqlEngine.Options.EnableTypeChecking))
 
-    // A REAL kotlin-fhir R4 Patient — the 'female' now originates from a live FHIR model object,
-    // not a string literal. THIS is what increment 4 adds over increment 3.
+    // A REAL kotlin-fhir R4 Patient — gender, a YEAR-precision birthDate, and a name.
+    // Everything the engine sees is produced by the reflection walker above.
     val fhirPatient = Patient(
-			gender = Enumeration.of(AdministrativeGender.Female, null),
-			birthDate = FhirDateWrapper(value = FhirDate.fromString("1985")),
-			)
+        gender = Enumeration.of(AdministrativeGender.Female, null),
+        birthDate = FhirDateWrapper(value = FhirDate.fromString("1985")),
+        name = listOf(HumanName(family = FhirString(value = "Berfel"))),
+    )
     println("kotlin-fhir Patient.gender.value.getCode() = ${fhirPatient.gender?.value?.getCode()}")
     val patientCI = toClassInstance(fhirPatient, "Patient")
 
     val probe = VersionedIdentifier().withId("Probe").withVersion("1.0.0")
     val results = engine.evaluate {
-        library(probe) { expressions("GenderValue", "BirthDateValue") }
+        library(probe) { expressions("GenderValue", "BirthDateValue", "FamilyNameValue") }
         parameters = mapOf("P" to patientCI)
     }.onlyResultOrThrow
-    println("v5 engine evaluated P.gender.value    = ${results["GenderValue"]?.value}   (expect: 'female')")
-    println("v5 engine evaluated P.birthDate.value = ${results["BirthDateValue"]?.value}   (expect: 1985-03-14)")
+    println("v5 engine evaluated P.gender.value             = ${results["GenderValue"]?.value}   (expect: 'female')")
+    println("v5 engine evaluated P.birthDate.value          = ${results["BirthDateValue"]?.value}   (expect: @1985 — year precision preserved)")
+    println("v5 engine evaluated First(P.name.family.value) = ${results["FamilyNameValue"]?.value}   (expect: 'Berfel')")
 }
