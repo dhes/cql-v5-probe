@@ -26,6 +26,9 @@ import org.opencds.cqf.cql.engine.runtime.Date as EngineDate
 import dev.ohs.fhir.model.r4.String as FhirString
 import org.opencds.cqf.cql.engine.runtime.List as CqlList
 import dev.ohs.fhir.model.r4.HumanName
+import dev.ohs.fhir.model.r4.Resource
+import kotlinx.serialization.json.Json
+import org.opencds.cqf.cql.engine.fhir.parser.fhirResourceJsonToCqlValue
 
 private const val FHIR = "http://hl7.org/fhir"
 
@@ -124,14 +127,29 @@ fun main() {
         name = listOf(HumanName(family = FhirString(value = "Berfel"))),
     )
     println("kotlin-fhir Patient.gender.value.getCode() = ${fhirPatient.gender?.value?.getCode()}")
+
+    // Path A — our reflection walker (JVM-only; kotlin-reflect).
     val patientCI = toClassInstance(fhirPatient, "Patient")
 
+    // Path B — PR #1814: ohs model -> FHIR JSON -> Anton's parser -> ClassInstance.
+    // Reflection-free and commonMain-compatible; the Model comes from the same ModelManager
+    // the compiler used, so parser and compiler agree on the type system.
+    val fhirJson = Json { explicitNulls = false }
+        .encodeToString(Resource.serializer(), fhirPatient)
+    println("kotlin-fhir Patient as FHIR JSON           = $fhirJson")
+    val patientCIParsed = fhirResourceJsonToCqlValue(
+        Buffer().apply { writeString(fhirJson) },
+        modelManager.resolveModel("FHIR", "4.0.1"),
+    )
+
     val probe = VersionedIdentifier().withId("Probe").withVersion("1.0.0")
-    val results = engine.evaluate {
-        library(probe) { expressions("GenderValue", "BirthDateValue", "FamilyNameValue") }
-        parameters = mapOf("P" to patientCI)
-    }.onlyResultOrThrow
-    println("v5 engine evaluated P.gender.value             = ${results["GenderValue"]?.value}   (expect: 'female')")
-    println("v5 engine evaluated P.birthDate.value          = ${results["BirthDateValue"]?.value}   (expect: @1985 — year precision preserved)")
-    println("v5 engine evaluated First(P.name.family.value) = ${results["FamilyNameValue"]?.value}   (expect: 'Berfel')")
+    for ((label, instance) in listOf("walker (A)" to patientCI, "#1814 parser (B)" to patientCIParsed)) {
+        val results = engine.evaluate {
+            library(probe) { expressions("GenderValue", "BirthDateValue", "FamilyNameValue") }
+            parameters = mapOf("P" to instance)
+        }.onlyResultOrThrow
+        println("[$label] P.gender.value             = ${results["GenderValue"]?.value}   (expect: 'female')")
+        println("[$label] P.birthDate.value          = ${results["BirthDateValue"]?.value}   (expect: @1985 — year precision preserved)")
+        println("[$label] First(P.name.family.value) = ${results["FamilyNameValue"]?.value}   (expect: 'Berfel')")
+    }
 }
