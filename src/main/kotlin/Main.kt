@@ -38,37 +38,67 @@ import org.opencds.cqf.cql.engine.fhir.terminology.SimpleFhirTerminologyProvider
 private const val FHIR = "http://hl7.org/fhir"
 
 /**
- * Trimmed CXCAEligibilityLogic in the DAK's own idiom: `context Patient` and a RETRIEVE with a
- * valueset — no parameters. The engine must fetch the data itself through the #1815 providers.
+ * CXCAEligibilityLogic in the DAK's own idiom: `context Patient`, retrieves with valuesets, and
+ * the full hit-policy-FIRST eligibility chain — no parameters. Differs from the WHO source only
+ * in explicit `.value` primitive access (avoids the FHIRHelpers include) and `AgeInYears()`
+ * (the engine supplies today).
  */
 private val ELIGIBILITY_CQL = """
     library EligibilityProbe version '1.0.0'
     using FHIR version '4.0.1'
     valueset "HIV-positive status": 'http://smart.who.int/cxca/ValueSet/hiv-positive-status'
+    valueset "Congenital absence of cervix": 'http://smart.who.int/cxca/ValueSet/absence-of-cervix'
+    valueset "Total hysterectomy": 'http://smart.who.int/cxca/ValueSet/total-hysterectomy'
     context Patient
+    define "Female Sex": Patient.gender.value = 'female'
+    define "Congenital Absence of Cervix": exists ([Condition: "Congenital absence of cervix"])
+    define "Acquired Absence of Cervix": exists ([Condition: "Total hysterectomy"])
+    define "Has Cervix": "Female Sex" and not "Congenital Absence of Cervix" and not "Acquired Absence of Cervix"
+    define "No Cervix": not "Has Cervix"
     define "Living with HIV":
       exists ([Observation: "HIV-positive status"] O where O.status.value in { 'final', 'amended' })
-    define "Screening Start Age":
-      if "Living with HIV" then 25 else 30
+    define "Current Patient Age In Years": AgeInYears()
+    define "Screening Start Age": if "Living with HIV" then 25 else 30
+    define "In Screening Age Range":
+      "Current Patient Age In Years" >= "Screening Start Age" and "Current Patient Age In Years" <= 65
+    define "Below Start Age": "Current Patient Age In Years" < "Screening Start Age"
+    define "Age over 65": "Current Patient Age In Years" > 65
+    define "Eligibility status":
+      if "No Cervix" then 'Not eligible'
+      else if "Below Start Age" then 'Not eligible'
+      else if "Age over 65" then 'Not eligible'
+      else if "In Screening Age Range" then 'Eligible'
+      else 'Not eligible'
 """.trimIndent()
 
-/** The patient's chart: Amina from smart-cxca-kmp — WLHIV, so her start age should be 25. */
+/** Four charts in one bundle — the same truth table smart-cxca-kmp's FHIRPath tests assert. */
 private val DATA_BUNDLE_JSON = """
     {"resourceType":"Bundle","type":"collection","entry":[
       {"resource":{"resourceType":"Patient","id":"cxca-wlhiv-27","gender":"female","birthDate":"1999-01-15"}},
       {"resource":{"resourceType":"Observation","id":"obs-hiv","status":"final",
         "code":{"coding":[{"system":"http://snomed.info/sct","code":"165816005"}]},
         "subject":{"reference":"Patient/cxca-wlhiv-27"}}},
-      {"resource":{"resourceType":"Patient","id":"cxca-gen-27","gender":"female","birthDate":"1999-03-10"}}
+      {"resource":{"resourceType":"Patient","id":"cxca-gen-27","gender":"female","birthDate":"1999-03-10"}},
+      {"resource":{"resourceType":"Patient","id":"cxca-hyst-45","gender":"female","birthDate":"1981-05-20"}},
+      {"resource":{"resourceType":"Condition","id":"cond-hyst",
+        "code":{"coding":[{"system":"http://snomed.info/sct","code":"428078001"}]},
+        "subject":{"reference":"Patient/cxca-hyst-45"}}},
+      {"resource":{"resourceType":"Patient","id":"cxca-elder-70","gender":"female","birthDate":"1956-02-01"}}
     ]}
 """.trimIndent()
 
-/** The terminology: the WHO valueset, compose.include shape as published in smart-cxca. */
+/** The terminology: the WHO valuesets, compose.include shape as published in smart-cxca. */
 private val TERMINOLOGY_BUNDLE_JSON = """
     {"resourceType":"Bundle","type":"collection","entry":[
       {"resource":{"resourceType":"ValueSet","id":"hiv-positive-status","status":"active",
         "url":"http://smart.who.int/cxca/ValueSet/hiv-positive-status",
-        "compose":{"include":[{"system":"http://snomed.info/sct","concept":[{"code":"165816005"}]}]}}}
+        "compose":{"include":[{"system":"http://snomed.info/sct","concept":[{"code":"165816005"}]}]}}},
+      {"resource":{"resourceType":"ValueSet","id":"absence-of-cervix","status":"active",
+        "url":"http://smart.who.int/cxca/ValueSet/absence-of-cervix",
+        "compose":{"include":[{"system":"http://snomed.info/sct","concept":[{"code":"37687000"}]}]}}},
+      {"resource":{"resourceType":"ValueSet","id":"total-hysterectomy","status":"active",
+        "url":"http://smart.who.int/cxca/ValueSet/total-hysterectomy",
+        "compose":{"include":[{"system":"http://snomed.info/sct","concept":[{"code":"428078001"}]}]}}}
     ]}
 """.trimIndent()
 
@@ -218,15 +248,22 @@ fun main() {
     )
 
     val eligibility = VersionedIdentifier().withId("EligibilityProbe").withVersion("1.0.0")
-    for ((patientId, expectHiv, expectAge) in listOf(
-        Triple("cxca-wlhiv-27", "true — via [Observation: valueset] retrieve", "25 — WLHIV rule"),
-        Triple("cxca-gen-27", "false — no HIV observation for her", "30 — general population"),
+    for ((patientId, expected) in listOf(
+        "cxca-wlhiv-27" to "'Eligible' — WLHIV, 27 >= start age 25",
+        "cxca-gen-27" to "'Not eligible' — 27 below general start age 30",
+        "cxca-hyst-45" to "'Not eligible' — total hysterectomy on record",
+        "cxca-elder-70" to "'Not eligible' — above 65",
     )) {
-        val retrieveResults = retrieveEngine.evaluate {
-            library(eligibility) { expressions("Living with HIV", "Screening Start Age") }
+        val r = retrieveEngine.evaluate {
+            library(eligibility) {
+                expressions("Living with HIV", "Current Patient Age In Years", "Has Cervix", "Eligibility status")
+            }
             contextParameter = "Patient" to patientId
         }.onlyResultOrThrow
-        println("[#1815 retrieve, $patientId] Living with HIV     = ${retrieveResults["Living with HIV"]?.value}   (expect: $expectHiv)")
-        println("[#1815 retrieve, $patientId] Screening Start Age = ${retrieveResults["Screening Start Age"]?.value}   (expect: $expectAge)")
+        println(
+            "[$patientId] HIV=${r["Living with HIV"]?.value} age=${r["Current Patient Age In Years"]?.value} " +
+                "cervix=${r["Has Cervix"]?.value} -> Eligibility status = ${r["Eligibility status"]?.value}"
+        )
+        println("             (expect: $expected)")
     }
 }
