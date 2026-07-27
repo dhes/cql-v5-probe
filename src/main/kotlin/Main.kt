@@ -29,8 +29,48 @@ import dev.ohs.fhir.model.r4.HumanName
 import dev.ohs.fhir.model.r4.Resource
 import kotlinx.serialization.json.Json
 import org.opencds.cqf.cql.engine.fhir.parser.fhirResourceJsonToCqlValue
+import org.opencds.cqf.cql.engine.data.CompositeDataProvider
+import org.opencds.cqf.cql.engine.fhir.fhirModelNamespaceUri
+import org.opencds.cqf.cql.engine.fhir.model.SimpleFhirModelResolver
+import org.opencds.cqf.cql.engine.fhir.retrieve.SimpleFhirRetrieveProvider
+import org.opencds.cqf.cql.engine.fhir.terminology.SimpleFhirTerminologyProvider
 
 private const val FHIR = "http://hl7.org/fhir"
+
+/**
+ * Trimmed CXCAEligibilityLogic in the DAK's own idiom: `context Patient` and a RETRIEVE with a
+ * valueset — no parameters. The engine must fetch the data itself through the #1815 providers.
+ */
+private val ELIGIBILITY_CQL = """
+    library EligibilityProbe version '1.0.0'
+    using FHIR version '4.0.1'
+    valueset "HIV-positive status": 'http://smart.who.int/cxca/ValueSet/hiv-positive-status'
+    context Patient
+    define "Living with HIV":
+      exists ([Observation: "HIV-positive status"] O where O.status.value in { 'final', 'amended' })
+    define "Screening Start Age":
+      if "Living with HIV" then 25 else 30
+""".trimIndent()
+
+/** The patient's chart: Amina from smart-cxca-kmp — WLHIV, so her start age should be 25. */
+private val DATA_BUNDLE_JSON = """
+    {"resourceType":"Bundle","type":"collection","entry":[
+      {"resource":{"resourceType":"Patient","id":"cxca-wlhiv-27","gender":"female","birthDate":"1999-01-15"}},
+      {"resource":{"resourceType":"Observation","id":"obs-hiv","status":"final",
+        "code":{"coding":[{"system":"http://snomed.info/sct","code":"165816005"}]},
+        "subject":{"reference":"Patient/cxca-wlhiv-27"}}},
+      {"resource":{"resourceType":"Patient","id":"cxca-gen-27","gender":"female","birthDate":"1999-03-10"}}
+    ]}
+""".trimIndent()
+
+/** The terminology: the WHO valueset, compose.include shape as published in smart-cxca. */
+private val TERMINOLOGY_BUNDLE_JSON = """
+    {"resourceType":"Bundle","type":"collection","entry":[
+      {"resource":{"resourceType":"ValueSet","id":"hiv-positive-status","status":"active",
+        "url":"http://smart.who.int/cxca/ValueSet/hiv-positive-status",
+        "compose":{"include":[{"system":"http://snomed.info/sct","concept":[{"code":"165816005"}]}]}}}
+    ]}
+""".trimIndent()
 
 private val FHIR_CQL = """
     library Probe version '1.0.0'
@@ -116,6 +156,7 @@ fun main() {
     }
     val libraryManager = LibraryManager(modelManager, options).apply {
         librarySourceLoader.registerProvider(InlineCqlSource("Probe", FHIR_CQL))
+        librarySourceLoader.registerProvider(InlineCqlSource("EligibilityProbe", ELIGIBILITY_CQL))
     }
     val engine = CqlEngine(Environment(libraryManager), mutableSetOf(CqlEngine.Options.EnableTypeChecking))
 
@@ -151,5 +192,41 @@ fun main() {
         println("[$label] P.gender.value             = ${results["GenderValue"]?.value}   (expect: 'female')")
         println("[$label] P.birthDate.value          = ${results["BirthDateValue"]?.value}   (expect: @1985 — year precision preserved)")
         println("[$label] First(P.name.family.value) = ${results["FamilyNameValue"]?.value}   (expect: 'Berfel')")
+    }
+
+    // ---- Part 2: the #1815 DataProvider — context Patient, retrieve, terminology ----
+    // The CQL below has NO parameters: the engine pulls Amina's chart through the retriever
+    // and answers the valueset membership through the terminology provider.
+    val fhirModel = modelManager.resolveModel("FHIR", "4.0.1")
+    fun parseBundle(json: String) =
+        fhirResourceJsonToCqlValue(Buffer().apply { writeString(json) }, fhirModel)
+
+    val terminology = SimpleFhirTerminologyProvider(parseBundle(TERMINOLOGY_BUNDLE_JSON))
+    val dataProvider = CompositeDataProvider(
+        SimpleFhirModelResolver(fhirModel),
+        SimpleFhirRetrieveProvider(parseBundle(DATA_BUNDLE_JSON), terminology),
+    )
+    val retrieveEngine = CqlEngine(
+        Environment(
+            libraryManager,
+            mutableMapOf<String?, org.opencds.cqf.cql.engine.data.DataProvider?>(
+                fhirModelNamespaceUri to dataProvider
+            ),
+            terminology,
+        ),
+        mutableSetOf(CqlEngine.Options.EnableTypeChecking),
+    )
+
+    val eligibility = VersionedIdentifier().withId("EligibilityProbe").withVersion("1.0.0")
+    for ((patientId, expectHiv, expectAge) in listOf(
+        Triple("cxca-wlhiv-27", "true — via [Observation: valueset] retrieve", "25 — WLHIV rule"),
+        Triple("cxca-gen-27", "false — no HIV observation for her", "30 — general population"),
+    )) {
+        val retrieveResults = retrieveEngine.evaluate {
+            library(eligibility) { expressions("Living with HIV", "Screening Start Age") }
+            contextParameter = "Patient" to patientId
+        }.onlyResultOrThrow
+        println("[#1815 retrieve, $patientId] Living with HIV     = ${retrieveResults["Living with HIV"]?.value}   (expect: $expectHiv)")
+        println("[#1815 retrieve, $patientId] Screening Start Age = ${retrieveResults["Screening Start Age"]?.value}   (expect: $expectAge)")
     }
 }
