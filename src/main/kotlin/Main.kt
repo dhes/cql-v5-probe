@@ -4,6 +4,7 @@ import dev.ohs.fhir.model.r4.terminologies.AdministrativeGender
 import kotlinx.io.Buffer
 import kotlinx.io.writeString
 import org.cqframework.cql.cql2elm.CqlCompilerOptions
+import org.cqframework.cql.cql2elm.CqlTranslator
 import org.cqframework.cql.cql2elm.LibraryContentType
 import org.cqframework.cql.cql2elm.LibraryManager
 import org.cqframework.cql.cql2elm.LibrarySourceProvider
@@ -265,5 +266,59 @@ fun main() {
                 "cervix=${r["Has Cervix"]?.value} -> Eligibility status = ${r["Eligibility status"]?.value}"
         )
         println("             (expect: $expected)")
+    }
+
+    // ---- Part 3: ELM shipping — a documented NEGATIVE result on the WIP branch ----
+    // Goal: evaluate from precompiled ELM JSON (what a DAK Library's application/elm+json
+    // attachment carries) with no CQL source at runtime. The loading pathway exists
+    // (LibraryManager tries content type JSON before compiling CQL), but three defects block it:
+    //   1. isVersionCompatible compares the ELM's translatorVersion against the loader's
+    //      compatibilityLevel ("1.5" by default) — apples to oranges; never matches unless the
+    //      loader sets compatibilityLevel to the translator version string.
+    //   2. Empty compiler options round-trip as a null translatorOptions annotation, failing
+    //      compilerOptionsMatch; options must be non-empty and identical on both sides.
+    //   3. Fatal: generateCompiledLibrary unconditionally requires def.resultType (a RESOLVED
+    //      DataType) on every statement def, but deserialization does not rehydrate it — and the
+    //      writer omits even the resultTypeName on the auto-generated `Patient` context def.
+    // Conclusion: ship CQL source and compile at init until upstream finishes ELM rehydration.
+    val elmJson = CqlTranslator.fromText(ELIGIBILITY_CQL, libraryManager).toJson()
+    val translatorVersion = Regex("\"translatorVersion\"\\s*:\\s*\"([^\"]+)\"")
+        .find(elmJson)?.groupValues?.get(1)
+    println("precompiled ELM JSON: ${elmJson.length} chars (translatorVersion $translatorVersion)")
+    val elmOnlyLibraryManager = LibraryManager(
+        modelManager,
+        CqlCompilerOptions().apply {
+            setOptions(CqlCompilerOptions.Options.EnableResultTypes, CqlCompilerOptions.Options.EnableLocators)
+            compatibilityLevel = translatorVersion ?: ""
+        },
+    ).apply {
+        librarySourceLoader.registerProvider(object : LibrarySourceProvider {
+            override fun getLibrarySource(libraryIdentifier: VersionedIdentifier) = null
+            override fun getLibraryContent(
+                libraryIdentifier: VersionedIdentifier,
+                type: LibraryContentType,
+            ) = if (libraryIdentifier.id == "EligibilityProbe" && type == LibraryContentType.JSON) {
+                Buffer().apply { writeString(elmJson) }
+            } else null
+        })
+    }
+    val elmEngine = CqlEngine(
+        Environment(
+            elmOnlyLibraryManager,
+            mutableMapOf<String?, org.opencds.cqf.cql.engine.data.DataProvider?>(
+                fhirModelNamespaceUri to dataProvider
+            ),
+            terminology,
+        ),
+    )
+    try {
+        val r = elmEngine.evaluate {
+            library(eligibility) { expressions("Eligibility status") }
+            contextParameter = "Patient" to "cxca-wlhiv-27"
+        }.onlyResultOrThrow
+        println("[ELM-only] Eligibility status = ${r["Eligibility status"]?.value}   (ELM loading works!)")
+    } catch (e: Exception) {
+        println("[ELM-only] blocked as expected on the WIP branch: ${e.message}")
+        println("           (def.resultType is not rehydrated on deserialization; see comment above)")
     }
 }
